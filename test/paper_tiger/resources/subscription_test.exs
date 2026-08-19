@@ -1330,6 +1330,39 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       assert invoice["amount_paid"] >= 79_900 and invoice["amount_paid"] <= 80_000
     end
 
+    test "adding an item by price leaves unmentioned items alone", %{
+      price: price,
+      subscription: sub
+    } do
+      prod_conn = request(:post, "/v1/products", %{"name" => "Support Add-on"})
+      product = json_response(prod_conn)
+
+      addon_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "usd",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "1500"
+        })
+
+      addon_price = json_response(addon_price_conn)
+
+      # The deltas real integrations send: just the new item. Stripe leaves
+      # every unmentioned item alone; deleting them turned "add an add-on"
+      # into "replace the whole subscription".
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"price" => addon_price["id"], "quantity" => "1"}],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      item_prices = updated["items"]["data"] |> Enum.map(& &1["price"]["id"]) |> Enum.sort()
+      assert item_prices == Enum.sort([price["id"], addon_price["id"]])
+    end
+
     test "an item marked deleted is removed by the update", %{
       customer: customer,
       price: price,

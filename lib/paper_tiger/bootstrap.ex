@@ -38,19 +38,25 @@ defmodule PaperTiger.Bootstrap do
   end
 
   defp wait_for_repo! do
-    repo = Application.fetch_env!(:paper_tiger, :repo)
-
-    Stream.repeatedly(fn ->
-      try do
-        repo.query!("SELECT 1")
+    case Application.fetch_env(:paper_tiger, :repo) do
+      # No repo configured — nothing to wait for. The standalone release seeds
+      # from init_data alone and has no host application database.
+      :error ->
         :ok
-      rescue
-        _ ->
-          Process.sleep(200)
-          :error
-      end
-    end)
-    |> Enum.find(&(&1 == :ok))
+
+      {:ok, repo} ->
+        Stream.repeatedly(fn ->
+          try do
+            repo.query!("SELECT 1")
+            :ok
+          rescue
+            _ ->
+              Process.sleep(200)
+              :error
+          end
+        end)
+        |> Enum.find(&(&1 == :ok))
+    end
   end
 
   ## Private Functions

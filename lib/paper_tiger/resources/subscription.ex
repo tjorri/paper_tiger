@@ -217,21 +217,31 @@ defmodule PaperTiger.Resources.Subscription do
     pagination_opts = parse_pagination_params(conn.params)
     all_subscriptions = Subscriptions.list_namespace(PaperTiger.Connect.storage_namespace())
 
+    # Stripe treats status "all" as the absence of a status filter: every
+    # subscription is returned regardless of status. Normalize it to nil here so
+    # the clauses below never see it as a literal status to match.
+    status_param =
+      case Map.get(conn.params, :status) do
+        nil ->
+          nil
+
+        status ->
+          status_string = if is_atom(status), do: Atom.to_string(status), else: status
+          if status_string == "all", do: nil, else: status_string
+      end
+
     filtered_subscriptions =
-      case {Map.get(conn.params, :customer), Map.get(conn.params, :status)} do
+      case {Map.get(conn.params, :customer), status_param} do
         {nil, nil} ->
           all_subscriptions
 
         {customer_id, nil} when is_binary(customer_id) ->
           Enum.filter(all_subscriptions, fn sub -> sub.customer == customer_id end)
 
-        {nil, status} ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
+        {nil, status_string} ->
           Enum.filter(all_subscriptions, fn sub -> sub.status == status_string end)
 
-        {customer_id, status} when is_binary(customer_id) ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
-
+        {customer_id, status_string} when is_binary(customer_id) ->
           Enum.filter(all_subscriptions, fn sub ->
             sub.customer == customer_id and sub.status == status_string
           end)

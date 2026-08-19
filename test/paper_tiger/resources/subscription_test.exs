@@ -884,6 +884,52 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       {:ok, customer_id: customer_id, price_id: price_id, subscription_ids: subscription_ids}
     end
 
+    test "the status filter follows Stripe's documented contract", %{
+      customer_id: customer_id,
+      price_id: price_id,
+      subscription_ids: subscription_ids
+    } do
+      # One canceled subscription, one expired due to incomplete payment,
+      # alongside the three active ones from setup.
+      canceled_id = hd(subscription_ids)
+      request(:delete, "/v1/subscriptions/#{canceled_id}", %{})
+
+      expired_conn =
+        request(:post, "/v1/subscriptions", %{
+          "customer" => customer_id,
+          "items" => [%{"price" => price_id, "quantity" => "1"}],
+          "status" => "incomplete_expired"
+        })
+
+      expired_id = json_response(expired_conn)["id"]
+
+      list = fn params ->
+        conn = request(:get, "/v1/subscriptions", Map.put(params, "customer", customer_id))
+        assert conn.status == 200
+        json_response(conn)["data"] |> Enum.map(& &1["id"]) |> MapSet.new()
+      end
+
+      # No value: everything that has not been canceled.
+      default_ids = list.(%{})
+      refute MapSet.member?(default_ids, canceled_id)
+      assert MapSet.member?(default_ids, expired_id)
+      assert MapSet.size(default_ids) == 3
+
+      # "all": every status.
+      all_ids = list.(%{"status" => "all"})
+      assert MapSet.member?(all_ids, canceled_id)
+      assert MapSet.member?(all_ids, expired_id)
+      assert MapSet.size(all_ids) == 4
+
+      # "ended": canceled plus expired-due-to-incomplete-payment.
+      ended_ids = list.(%{"status" => "ended"})
+      assert ended_ids == MapSet.new([canceled_id, expired_id])
+
+      # A literal status still matches literally.
+      canceled_ids = list.(%{"status" => "canceled"})
+      assert canceled_ids == MapSet.new([canceled_id])
+    end
+
     test "lists all subscriptions", %{subscription_ids: subscription_ids} do
       conn = request(:get, "/v1/subscriptions", %{})
 

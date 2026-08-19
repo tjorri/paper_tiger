@@ -40,6 +40,12 @@ if config_env() == :prod do
   if level = System.get_env("PAPER_TIGER_LOG_LEVEL") do
     config :logger, level: String.to_existing_atom(level)
   end
+
+  # Static seed data: a path to a JSON file, typically mounted into the
+  # container. See `PaperTiger.Initializer` for the format.
+  if init_data = System.get_env("PAPER_TIGER_INIT_DATA") do
+    config :paper_tiger, init_data: init_data
+  end
 end
 
 # Configure stripity_stripe at runtime

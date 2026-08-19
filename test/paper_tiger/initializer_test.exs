@@ -2,7 +2,7 @@ defmodule PaperTiger.InitializerTest do
   use ExUnit.Case, async: false
 
   alias PaperTiger.Initializer
-  alias PaperTiger.Store.{Customers, Plans, Prices, Products}
+  alias PaperTiger.Store.{Customers, Plans, Prices, Products, Webhooks}
 
   setup do
     PaperTiger.flush()
@@ -61,6 +61,28 @@ defmodule PaperTiger.InitializerTest do
       assert {:ok, price} = Prices.get("price_test_1")
       assert price.unit_amount == 1000
       assert price.recurring == %{interval: "month", interval_count: 1}
+    end
+
+    test "loads webhook endpoints, honoring a caller-supplied secret" do
+      data = %{
+        "webhook_endpoints" => [
+          %{
+            "id" => "we_test_1",
+            "url" => "http://receiver.internal/webhook",
+            "secret" => "whsec_fixed_for_test",
+            "enabled_events" => ["customer.subscription.created", "customer.subscription.updated"]
+          }
+        ]
+      }
+
+      assert {:ok, stats} = Initializer.load_from_map(data)
+      assert stats.webhook_endpoints == 1
+
+      assert {:ok, webhook} = Webhooks.get("we_test_1")
+      assert webhook.secret == "whsec_fixed_for_test"
+      assert webhook.url == "http://receiver.internal/webhook"
+      assert webhook.status == "enabled"
+      assert webhook.enabled_events == ["customer.subscription.created", "customer.subscription.updated"]
     end
 
     test "loads plans" do

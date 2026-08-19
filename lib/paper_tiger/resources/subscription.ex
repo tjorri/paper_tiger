@@ -548,55 +548,61 @@ defmodule PaperTiger.Resources.Subscription do
     }
   end
 
+  # Stripe's update items are DELTAS, not a replacement list: an entry with an
+  # id updates (or, with deleted: true, removes) that item; an id-less entry
+  # whose price matches an existing item updates it; an id-less entry with a
+  # new price adds an item; and items the payload does not mention are left
+  # alone. The previous implementation deleted every unmentioned item, so a
+  # client adding one item — the deltas real integrations send — silently lost
+  # the rest of the subscription.
   defp update_subscription_items(subscription_id, items) when is_list(items) do
     existing_items = SubscriptionItems.find_by_subscription(subscription_id)
     existing_by_id = Map.new(existing_items, &{&1.id, &1})
 
-    # Track which existing items we've seen (to delete removed ones)
-    seen_ids = MapSet.new()
-
-    # Process each item in the update payload
-    {seen_ids, _} =
-      items
-      |> Enum.with_index()
-      |> Enum.reduce({seen_ids, PaperTiger.now()}, fn {item, index}, {seen, now} ->
-        item_id = get_item_field(item, :id)
-
-        cond do
-          # Item marked deleted - remove it. Stripe's update-items contract:
-          # %{id: "si_...", deleted: true} deletes that item. Checked before
-          # the update branch, which would otherwise swallow the flag and
-          # keep the item alive forever. Marked seen so the trailing cleanup
-          # does not double-handle it.
-          item_id && item_deleted?(item) ->
-            SubscriptionItems.delete(item_id)
-            {MapSet.put(seen, item_id), now}
-
-          # Item has an ID and exists - update it
-          item_id && Map.has_key?(existing_by_id, item_id) ->
-            existing = existing_by_id[item_id]
-            updated = update_existing_item(existing, item)
-            SubscriptionItems.update(updated)
-            {MapSet.put(seen, item_id), now}
-
-          # Item has an ID but doesn't exist - create with that ID (edge case)
-          item_id ->
-            new_item = build_subscription_item(subscription_id, item, now + index, item_id)
-            SubscriptionItems.insert(new_item)
-            {MapSet.put(seen, item_id), now}
-
-          # No ID - create new item
-          true ->
-            new_item = build_subscription_item(subscription_id, item, now + index, nil)
-            SubscriptionItems.insert(new_item)
-            {seen, now}
-        end
+    existing_by_price =
+      Map.new(existing_items, fn item ->
+        price = item[:price]
+        price_id = if is_map(price), do: price[:id] || price["id"], else: price
+        {to_string(price_id), item}
       end)
 
-    # Delete items that weren't in the update payload
-    existing_items
-    |> Enum.reject(&MapSet.member?(seen_ids, &1.id))
-    |> Enum.each(&SubscriptionItems.delete(&1.id))
+    now = PaperTiger.now()
+
+    items
+    |> Enum.with_index()
+    |> Enum.each(fn {item, index} ->
+      item_id = get_item_field(item, :id)
+      price_ref = get_item_field(item, :price)
+      price_match = price_ref && Map.get(existing_by_price, to_string(price_ref))
+
+      cond do
+        # Explicitly deleted — remove it. The only deletion path.
+        item_id && item_deleted?(item) ->
+          SubscriptionItems.delete(item_id)
+
+        # Item named by id and exists — update it.
+        item_id && Map.has_key?(existing_by_id, item_id) ->
+          existing = existing_by_id[item_id]
+          updated = update_existing_item(existing, item)
+          SubscriptionItems.update(updated)
+
+        # Item named by id but doesn't exist — create with that id (edge case).
+        item_id ->
+          new_item = build_subscription_item(subscription_id, item, now + index, item_id)
+          SubscriptionItems.insert(new_item)
+
+        # No id, but the price matches an existing item — Stripe updates that
+        # item rather than adding a duplicate.
+        price_match ->
+          updated = update_existing_item(price_match, item)
+          SubscriptionItems.update(updated)
+
+        # No id, new price — add an item.
+        true ->
+          new_item = build_subscription_item(subscription_id, item, now + index, nil)
+          SubscriptionItems.insert(new_item)
+      end
+    end)
 
     :ok
   end

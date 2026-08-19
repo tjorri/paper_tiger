@@ -562,6 +562,15 @@ defmodule PaperTiger.Resources.Subscription do
         item_id = get_item_field(item, :id)
 
         cond do
+          # Item marked deleted - remove it. Stripe's update-items contract:
+          # %{id: "si_...", deleted: true} deletes that item. Checked before
+          # the update branch, which would otherwise swallow the flag and
+          # keep the item alive forever. Marked seen so the trailing cleanup
+          # does not double-handle it.
+          item_id && item_deleted?(item) ->
+            SubscriptionItems.delete(item_id)
+            {MapSet.put(seen, item_id), now}
+
           # Item has an ID and exists - update it
           item_id && Map.has_key?(existing_by_id, item_id) ->
             existing = existing_by_id[item_id]
@@ -592,6 +601,9 @@ defmodule PaperTiger.Resources.Subscription do
   end
 
   defp update_subscription_items(_subscription_id, _invalid), do: :ok
+
+  # Form-encoded bodies carry booleans as strings, so accept both shapes.
+  defp item_deleted?(item), do: get_item_field(item, :deleted) in [true, "true"]
 
   defp build_subscription_item(subscription_id, item, created_at, custom_id) do
     price_id = get_item_field(item, :price)
@@ -728,8 +740,15 @@ defmodule PaperTiger.Resources.Subscription do
   defp line_price_id(price) when is_map(price), do: price[:id]
   defp line_price_id(_price), do: "unknown"
 
-  defp proration_auto_paid?(subscription, proration_behavior) do
-    proration_behavior == "always_invoice" and is_binary(subscription.default_payment_method)
+  # Real Stripe charges an always_invoice proration against the subscription's
+  # default payment method, falling back to the customer's invoice settings and
+  # default source — surfaces this emulator does not model. Conditioning on the
+  # subscription-level field alone left every such invoice open forever, which
+  # no configuration of a real, payable customer produces. The emulator's
+  # stance everywhere else is that payments succeed (checkout sessions
+  # auto-complete), so the proration charge succeeds too.
+  defp proration_auto_paid?(_subscription, proration_behavior) do
+    proration_behavior == "always_invoice"
   end
 
   defp proration_invoice_status("always_invoice", true), do: "paid"

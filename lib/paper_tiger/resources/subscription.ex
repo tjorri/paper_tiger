@@ -217,23 +217,41 @@ defmodule PaperTiger.Resources.Subscription do
     pagination_opts = parse_pagination_params(conn.params)
     all_subscriptions = Subscriptions.list_namespace(PaperTiger.Connect.storage_namespace())
 
+    # Stripe's status filter has two meta-values that are not literal
+    # statuses, and a documented default: "all" returns subscriptions of
+    # every status, "ended" returns those that are canceled or expired due to
+    # incomplete payment, and no value returns everything that has not been
+    # canceled. Everything else matches the literal status.
+    status_filter =
+      case Map.get(conn.params, :status) do
+        nil ->
+          :default
+
+        status ->
+          case if(is_atom(status), do: Atom.to_string(status), else: status) do
+            "all" -> :all
+            "ended" -> :ended
+            other -> {:literal, other}
+          end
+      end
+
+    matches_status? = fn sub ->
+      case status_filter do
+        :all -> true
+        :default -> sub.status != "canceled"
+        :ended -> sub.status in ["canceled", "incomplete_expired"]
+        {:literal, status_string} -> sub.status == status_string
+      end
+    end
+
     filtered_subscriptions =
-      case {Map.get(conn.params, :customer), Map.get(conn.params, :status)} do
-        {nil, nil} ->
-          all_subscriptions
+      case Map.get(conn.params, :customer) do
+        nil ->
+          Enum.filter(all_subscriptions, matches_status?)
 
-        {customer_id, nil} when is_binary(customer_id) ->
-          Enum.filter(all_subscriptions, fn sub -> sub.customer == customer_id end)
-
-        {nil, status} ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
-          Enum.filter(all_subscriptions, fn sub -> sub.status == status_string end)
-
-        {customer_id, status} when is_binary(customer_id) ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
-
+        customer_id when is_binary(customer_id) ->
           Enum.filter(all_subscriptions, fn sub ->
-            sub.customer == customer_id and sub.status == status_string
+            sub.customer == customer_id and matches_status?.(sub)
           end)
       end
 

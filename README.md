@@ -141,6 +141,7 @@ All settings are environment variables. None are required.
 | `PAPER_TIGER_CLOCK_MULTIPLIER` | `1` | Seconds of simulated time per real second, in `accelerated` mode. |
 | `PAPER_TIGER_BILLING_ENGINE` | `false` | Advance subscriptions and finalize invoices on a timer. Leave off when driving the clock yourself. |
 | `PAPER_TIGER_LOG_LEVEL` | `info` | Standard Elixir log levels. |
+| `PAPER_TIGER_INIT_DATA` | *(unset)* | Path to a JSON file of static seed data, loaded at startup. See [Initial Data](#initial-data). |
 
 `GET /health` responds `{"status":"ok","service":"paper_tiger"}` without an
 Authorization header, for container and load balancer probes. Every `/v1/*` path
@@ -1051,7 +1052,7 @@ config :stripity_stripe,
 
 ### Initial Data
 
-PaperTiger can pre-populate products, prices, and customers on startup via the `init_data` config. Since ETS is ephemeral, this runs on every application start - useful for development environments where you need consistent Stripe data available immediately.
+PaperTiger can pre-populate products, prices, customers, and webhook endpoints on startup via the `init_data` config. Since ETS is ephemeral, this runs on every application start - useful for development environments where you need consistent Stripe data available immediately.
 
 ```elixir
 # config/dev.exs - From a JSON file
@@ -1080,6 +1081,24 @@ config :paper_tiger,
     ]
   }
 ```
+
+Webhook endpoints may carry a caller-supplied `secret` (`whsec_*`), so a receiver that needs the signing secret in its own configuration before either process starts can commit one value and hand it to both sides:
+
+```elixir
+config :paper_tiger,
+  init_data: %{
+    webhook_endpoints: [
+      %{
+        id: "we_dev_local",
+        url: "http://localhost:4000/stripe/webhook",
+        secret: "whsec_dev_fixed",
+        enabled_events: ["customer.subscription.*"]
+      }
+    ]
+  }
+```
+
+The standalone container image reads `PAPER_TIGER_INIT_DATA` — a path to a JSON file of the same shape, typically mounted into the container.
 
 Use custom IDs (like `prod_dev_*`) to ensure deterministic data across restarts. This is particularly useful when your app syncs from Stripe on startup - the data will be there before your sync runs.
 

@@ -44,13 +44,22 @@ defmodule PaperTiger.Initializer do
   - Products: `prod_*`
   - Prices: `price_*`
   - Customers: `cus_*`
+  - Webhook endpoints: `we_*`
   - etc.
+
+  ## Webhook Endpoints
+
+  Webhook endpoints may carry a caller-supplied `secret` (`whsec_*`). This is
+  what makes a committed, deterministic seed possible for a receiver that
+  needs the signing secret in its own configuration before either process
+  starts — commit one value, hand it to both sides.
   """
 
   alias PaperTiger.Store.Customers
   alias PaperTiger.Store.Plans
   alias PaperTiger.Store.Prices
   alias PaperTiger.Store.Products
+  alias PaperTiger.Store.Webhooks
 
   require Logger
 
@@ -119,14 +128,15 @@ defmodule PaperTiger.Initializer do
       customers: load_customers(get_list(data, :customers)),
       plans: load_plans(get_list(data, :plans)),
       prices: load_prices(get_list(data, :prices)),
-      products: load_products(get_list(data, :products))
+      products: load_products(get_list(data, :products)),
+      webhook_endpoints: load_webhook_endpoints(get_list(data, :webhook_endpoints))
     }
 
-    total = stats.products + stats.prices + stats.plans + stats.customers
+    total = stats.products + stats.prices + stats.plans + stats.customers + stats.webhook_endpoints
 
     if total > 0 do
       Logger.debug(
-        "PaperTiger loaded init_data: #{total} entities (#{stats.products} products, #{stats.prices} prices, #{stats.plans} plans, #{stats.customers} customers)"
+        "PaperTiger loaded init_data: #{total} entities (#{stats.products} products, #{stats.prices} prices, #{stats.plans} plans, #{stats.customers} customers, #{stats.webhook_endpoints} webhook endpoints)"
       )
     end
 
@@ -218,6 +228,43 @@ defmodule PaperTiger.Initializer do
       {:ok, _customer} = Customers.insert(customer)
       count + 1
     end)
+  end
+
+  defp load_webhook_endpoints(webhook_endpoints) do
+    Enum.reduce(webhook_endpoints, 0, fn webhook_data, count ->
+      webhook = build_webhook_endpoint(webhook_data)
+      {:ok, _webhook} = Webhooks.insert(webhook)
+      count + 1
+    end)
+  end
+
+  # Mirrors PaperTiger.Resources.Webhook.build_webhook/1, with two seeding
+  # affordances: a custom `we_*` id, and a caller-supplied `secret` — so a
+  # consumer whose webhook receiver needs the signing secret in *its* own
+  # configuration before either process starts can commit one value and hand
+  # it to both sides.
+  defp build_webhook_endpoint(data) do
+    %{
+      api_version: "2023-10-16",
+      connect: false,
+      created: PaperTiger.now(),
+      enabled_events: get_field(data, :enabled_events, ["*"]),
+      id: get_field(data, :id) || PaperTiger.Resource.generate_id("we"),
+      livemode: false,
+      metadata: atomize_keys(get_field(data, :metadata, %{})),
+      object: "webhook_endpoint",
+      secret: get_field(data, :secret) || generate_webhook_secret(),
+      status: get_field(data, :status, "enabled"),
+      url: get_field(data, :url),
+      version: nil
+    }
+  end
+
+  defp generate_webhook_secret do
+    "whsec_" <>
+      (:crypto.strong_rand_bytes(32)
+       |> Base.encode16(case: :lower)
+       |> binary_part(0, 32))
   end
 
   defp build_product(data) do

@@ -1336,7 +1336,12 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       inv_conn = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{})
       assert inv_conn.status == 200
       invoice = json_response(inv_conn)
-      assert invoice["status"] == "open"
+      # Paid, not open: real Stripe charges an always_invoice proration against
+      # the customer's payment defaults, and the emulator's stance is that
+      # payments succeed. An invoice left open forever is a state no payable
+      # customer produces.
+      assert invoice["status"] == "paid"
+      assert invoice["paid"] == true
       assert invoice["subscription"] == sub["id"]
       assert invoice["customer"] == sub["customer"]
     end

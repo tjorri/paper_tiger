@@ -746,8 +746,15 @@ defmodule PaperTiger.Resources.Subscription do
   defp line_price_id(price) when is_map(price), do: price[:id]
   defp line_price_id(_price), do: "unknown"
 
-  defp proration_auto_paid?(subscription, proration_behavior) do
-    proration_behavior == "always_invoice" and is_binary(subscription.default_payment_method)
+  # Real Stripe charges an always_invoice proration against the subscription's
+  # default payment method, falling back to the customer's invoice settings and
+  # default source — surfaces this emulator does not model. Conditioning on the
+  # subscription-level field alone left every such invoice open forever, which
+  # no configuration of a real, payable customer produces. The emulator's
+  # stance everywhere else is that payments succeed (checkout sessions
+  # auto-complete), so the proration charge succeeds too.
+  defp proration_auto_paid?(_subscription, proration_behavior) do
+    proration_behavior == "always_invoice"
   end
 
   defp proration_invoice_status("always_invoice", true), do: "paid"

@@ -160,7 +160,7 @@ defmodule PaperTiger.Resources.SubscriptionPlanPriceTest do
       {:ok, subscription: subscription}
     end
 
-    test "updates subscription items with new price", %{subscription: subscription} do
+    test "an id-less new price adds an item and the existing item persists", %{subscription: subscription} do
       conn =
         conn(:post, "/v1/subscriptions/#{subscription["id"]}", %{
           items: [%{price: "plan_test_monthly", quantity: 2}]
@@ -171,9 +171,12 @@ defmodule PaperTiger.Resources.SubscriptionPlanPriceTest do
       assert conn.status == 200
       response = Jason.decode!(conn.resp_body)
 
-      [item] = response["items"]["data"]
-      assert item["price"]["id"] == "plan_test_monthly"
-      assert item["quantity"] == 2
+      # Stripe's update items are deltas: the unmentioned price_test_monthly
+      # item survives, and the new price becomes a second item.
+      items = response["items"]["data"]
+      assert items |> Enum.map(& &1["price"]["id"]) |> Enum.sort() == ["plan_test_monthly", "price_test_monthly"]
+      added = Enum.find(items, &(&1["price"]["id"] == "plan_test_monthly"))
+      assert added["quantity"] == 2
     end
   end
 

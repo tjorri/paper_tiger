@@ -41,6 +41,7 @@ defmodule PaperTiger.Resources.Subscription do
 
   alias PaperTiger.AutomaticTax
   alias PaperTiger.Discounts
+  alias PaperTiger.Proration
   alias PaperTiger.Search
   alias PaperTiger.Store.Customers
   alias PaperTiger.Store.InvoiceItems
@@ -162,7 +163,7 @@ defmodule PaperTiger.Resources.Subscription do
 
       items_after_update = SubscriptionItems.find_by_subscription(id)
       billable_items_changed = billable_items_changed?(existing_items, items_after_update)
-      updated = maybe_create_proration_invoice(updated, conn.params, billable_items_changed)
+      updated = maybe_create_proration_invoice(updated, conn.params, billable_items_changed, existing_items)
 
       updated_with_items = load_subscription_items(updated)
       previous_attributes = diff_attributes(existing, updated_with_items)
@@ -217,23 +218,41 @@ defmodule PaperTiger.Resources.Subscription do
     pagination_opts = parse_pagination_params(conn.params)
     all_subscriptions = Subscriptions.list_namespace(PaperTiger.Connect.storage_namespace())
 
+    # Stripe's status filter has two meta-values that are not literal
+    # statuses, and a documented default: "all" returns subscriptions of
+    # every status, "ended" returns those that are canceled or expired due to
+    # incomplete payment, and no value returns everything that has not been
+    # canceled. Everything else matches the literal status.
+    status_filter =
+      case Map.get(conn.params, :status) do
+        nil ->
+          :default
+
+        status ->
+          case if(is_atom(status), do: Atom.to_string(status), else: status) do
+            "all" -> :all
+            "ended" -> :ended
+            other -> {:literal, other}
+          end
+      end
+
+    matches_status? = fn sub ->
+      case status_filter do
+        :all -> true
+        :default -> sub.status != "canceled"
+        :ended -> sub.status in ["canceled", "incomplete_expired"]
+        {:literal, status_string} -> sub.status == status_string
+      end
+    end
+
     filtered_subscriptions =
-      case {Map.get(conn.params, :customer), Map.get(conn.params, :status)} do
-        {nil, nil} ->
-          all_subscriptions
+      case Map.get(conn.params, :customer) do
+        nil ->
+          Enum.filter(all_subscriptions, matches_status?)
 
-        {customer_id, nil} when is_binary(customer_id) ->
-          Enum.filter(all_subscriptions, fn sub -> sub.customer == customer_id end)
-
-        {nil, status} ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
-          Enum.filter(all_subscriptions, fn sub -> sub.status == status_string end)
-
-        {customer_id, status} when is_binary(customer_id) ->
-          status_string = if is_atom(status), do: Atom.to_string(status), else: status
-
+        customer_id when is_binary(customer_id) ->
           Enum.filter(all_subscriptions, fn sub ->
-            sub.customer == customer_id and sub.status == status_string
+            sub.customer == customer_id and matches_status?.(sub)
           end)
       end
 
@@ -547,51 +566,69 @@ defmodule PaperTiger.Resources.Subscription do
     }
   end
 
+  # Stripe's update items are DELTAS, not a replacement list: an entry with an
+  # id updates (or, with deleted: true, removes) that item; an id-less entry
+  # whose price matches an existing item updates it; an id-less entry with a
+  # new price adds an item; and items the payload does not mention are left
+  # alone. The previous implementation deleted every unmentioned item, so a
+  # client adding one item — the deltas real integrations send — silently lost
+  # the rest of the subscription.
   defp update_subscription_items(subscription_id, items) when is_list(items) do
     existing_items = SubscriptionItems.find_by_subscription(subscription_id)
     existing_by_id = Map.new(existing_items, &{&1.id, &1})
 
-    # Track which existing items we've seen (to delete removed ones)
-    seen_ids = MapSet.new()
-
-    # Process each item in the update payload
-    {seen_ids, _} =
-      items
-      |> Enum.with_index()
-      |> Enum.reduce({seen_ids, PaperTiger.now()}, fn {item, index}, {seen, now} ->
-        item_id = get_item_field(item, :id)
-
-        cond do
-          # Item has an ID and exists - update it
-          item_id && Map.has_key?(existing_by_id, item_id) ->
-            existing = existing_by_id[item_id]
-            updated = update_existing_item(existing, item)
-            SubscriptionItems.update(updated)
-            {MapSet.put(seen, item_id), now}
-
-          # Item has an ID but doesn't exist - create with that ID (edge case)
-          item_id ->
-            new_item = build_subscription_item(subscription_id, item, now + index, item_id)
-            SubscriptionItems.insert(new_item)
-            {MapSet.put(seen, item_id), now}
-
-          # No ID - create new item
-          true ->
-            new_item = build_subscription_item(subscription_id, item, now + index, nil)
-            SubscriptionItems.insert(new_item)
-            {seen, now}
-        end
+    existing_by_price =
+      Map.new(existing_items, fn item ->
+        price = item[:price]
+        price_id = if is_map(price), do: price[:id] || price["id"], else: price
+        {to_string(price_id), item}
       end)
 
-    # Delete items that weren't in the update payload
-    existing_items
-    |> Enum.reject(&MapSet.member?(seen_ids, &1.id))
-    |> Enum.each(&SubscriptionItems.delete(&1.id))
+    now = PaperTiger.now()
+
+    items
+    |> Enum.with_index()
+    |> Enum.each(fn {item, index} ->
+      item_id = get_item_field(item, :id)
+      price_ref = get_item_field(item, :price)
+      price_match = price_ref && Map.get(existing_by_price, to_string(price_ref))
+
+      cond do
+        # Explicitly deleted — remove it. The only deletion path.
+        item_id && item_deleted?(item) ->
+          SubscriptionItems.delete(item_id)
+
+        # Item named by id and exists — update it.
+        item_id && Map.has_key?(existing_by_id, item_id) ->
+          existing = existing_by_id[item_id]
+          updated = update_existing_item(existing, item)
+          SubscriptionItems.update(updated)
+
+        # Item named by id but doesn't exist — create with that id (edge case).
+        item_id ->
+          new_item = build_subscription_item(subscription_id, item, now + index, item_id)
+          SubscriptionItems.insert(new_item)
+
+        # No id, but the price matches an existing item — Stripe updates that
+        # item rather than adding a duplicate.
+        price_match ->
+          updated = update_existing_item(price_match, item)
+          SubscriptionItems.update(updated)
+
+        # No id, new price — add an item.
+        true ->
+          new_item = build_subscription_item(subscription_id, item, now + index, nil)
+          SubscriptionItems.insert(new_item)
+      end
+    end)
 
     :ok
   end
 
   defp update_subscription_items(_subscription_id, _invalid), do: :ok
+
+  # Form-encoded bodies carry booleans as strings, so accept both shapes.
+  defp item_deleted?(item), do: get_item_field(item, :deleted) in [true, "true"]
 
   defp build_subscription_item(subscription_id, item, created_at, custom_id) do
     price_id = get_item_field(item, :price)
@@ -666,11 +703,11 @@ defmodule PaperTiger.Resources.Subscription do
 
   # When proration_behavior is set and items changed, Stripe creates a proration
   # invoice and sets latest_invoice on the subscription response.
-  defp maybe_create_proration_invoice(subscription, params, billable_items_changed?) do
+  defp maybe_create_proration_invoice(subscription, params, billable_items_changed?, pre_update_items) do
     proration_behavior = Map.get(params, :proration_behavior)
 
     if should_create_proration_invoice?(billable_items_changed?, proration_behavior),
-      do: create_proration_invoice(subscription, proration_behavior),
+      do: create_proration_invoice(subscription, proration_behavior, pre_update_items),
       else: subscription
   end
 
@@ -678,12 +715,26 @@ defmodule PaperTiger.Resources.Subscription do
     billable_items_changed? and proration_behavior in ["always_invoice", "create_prorations"]
   end
 
-  defp create_proration_invoice(subscription, proration_behavior) do
+  # The lines come from PaperTiger.Proration — the same arithmetic the
+  # create_preview quote uses — so what was quoted is what is charged: credit
+  # the removed items' unused remainder, charge the added items' remainder,
+  # scaled by how much of the current period is left. A net credit clamps the
+  # charge to zero rather than inventing a negative payment.
+  defp create_proration_invoice(subscription, proration_behavior, pre_update_items) do
     items = SubscriptionItems.find_by_subscription(subscription.id)
     now = PaperTiger.now()
     invoice_id = generate_id("in")
-    lines = Enum.map(items, &build_proration_invoice_line(&1, now, proration_behavior))
-    total = Enum.reduce(lines, 0, fn line, acc -> acc + line.amount end)
+    ratio = Proration.remaining_ratio(subscription, now)
+
+    lines =
+      Proration.lines(
+        Enum.map(pre_update_items, &normalize_proration_item/1),
+        Enum.map(items, &normalize_proration_item/1),
+        ratio,
+        now
+      )
+
+    total = Enum.reduce(lines, 0, fn line, acc -> acc + line.amount end) |> max(0)
     auto_paid = proration_auto_paid?(subscription, proration_behavior)
     status = proration_invoice_status(proration_behavior, auto_paid)
 
@@ -702,34 +753,29 @@ defmodule PaperTiger.Resources.Subscription do
     persist_latest_invoice(subscription, invoice_id)
   end
 
-  defp build_proration_invoice_line(item, now, proration_behavior) do
+  # Store items embed the full price object; direct maps may carry a bare id.
+  defp normalize_proration_item(item) do
     price = item[:price]
-    quantity = item[:quantity] || 1
-    unit_amount = line_unit_amount(price)
-    amount = unit_amount * quantity
+    price_map = if is_map(price), do: price, else: %{}
+    price_id = price_map[:id] || price_map["id"] || (is_binary(price) && price) || nil
 
     %{
-      amount: amount,
-      currency: "usd",
-      description: "#{quantity} x (#{line_price_id(price)})",
-      id: generate_id("il"),
-      object: "line_item",
-      period: %{end: now + 30 * 86_400, start: now},
-      price: price,
-      proration: proration_behavior == "create_prorations",
-      quantity: quantity,
-      type: "subscription"
+      price_id: price_id,
+      product: price_map[:product],
+      quantity: item[:quantity] || 1,
+      unit_amount: price_map[:unit_amount] || 0
     }
   end
 
-  defp line_unit_amount(price) when is_map(price), do: price[:unit_amount] || 0
-  defp line_unit_amount(_price), do: 0
-
-  defp line_price_id(price) when is_map(price), do: price[:id]
-  defp line_price_id(_price), do: "unknown"
-
-  defp proration_auto_paid?(subscription, proration_behavior) do
-    proration_behavior == "always_invoice" and is_binary(subscription.default_payment_method)
+  # Real Stripe charges an always_invoice proration against the subscription's
+  # default payment method, falling back to the customer's invoice settings and
+  # default source — surfaces this emulator does not model. Conditioning on the
+  # subscription-level field alone left every such invoice open forever, which
+  # no configuration of a real, payable customer produces. The emulator's
+  # stance everywhere else is that payments succeed (checkout sessions
+  # auto-complete), so the proration charge succeeds too.
+  defp proration_auto_paid?(_subscription, proration_behavior) do
+    proration_behavior == "always_invoice"
   end
 
   defp proration_invoice_status("always_invoice", true), do: "paid"
@@ -742,7 +788,7 @@ defmodule PaperTiger.Resources.Subscription do
       amount_paid: if(auto_paid, do: total, else: 0),
       amount_remaining: if(auto_paid, do: 0, else: total),
       created: now,
-      currency: "usd",
+      currency: Proration.invoice_currency(lines),
       customer: subscription.customer,
       id: invoice_id,
       lines: %{data: lines, has_more: false, object: "list", url: "/v1/invoices/#{invoice_id}/lines"},

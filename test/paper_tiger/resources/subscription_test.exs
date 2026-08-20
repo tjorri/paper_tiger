@@ -884,6 +884,52 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       {:ok, customer_id: customer_id, price_id: price_id, subscription_ids: subscription_ids}
     end
 
+    test "the status filter follows Stripe's documented contract", %{
+      customer_id: customer_id,
+      price_id: price_id,
+      subscription_ids: subscription_ids
+    } do
+      # One canceled subscription, one expired due to incomplete payment,
+      # alongside the three active ones from setup.
+      canceled_id = hd(subscription_ids)
+      request(:delete, "/v1/subscriptions/#{canceled_id}", %{})
+
+      expired_conn =
+        request(:post, "/v1/subscriptions", %{
+          "customer" => customer_id,
+          "items" => [%{"price" => price_id, "quantity" => "1"}],
+          "status" => "incomplete_expired"
+        })
+
+      expired_id = json_response(expired_conn)["id"]
+
+      list = fn params ->
+        conn = request(:get, "/v1/subscriptions", Map.put(params, "customer", customer_id))
+        assert conn.status == 200
+        json_response(conn)["data"] |> Enum.map(& &1["id"]) |> MapSet.new()
+      end
+
+      # No value: everything that has not been canceled.
+      default_ids = list.(%{})
+      refute MapSet.member?(default_ids, canceled_id)
+      assert MapSet.member?(default_ids, expired_id)
+      assert MapSet.size(default_ids) == 3
+
+      # "all": every status.
+      all_ids = list.(%{"status" => "all"})
+      assert MapSet.member?(all_ids, canceled_id)
+      assert MapSet.member?(all_ids, expired_id)
+      assert MapSet.size(all_ids) == 4
+
+      # "ended": canceled plus expired-due-to-incomplete-payment.
+      ended_ids = list.(%{"status" => "ended"})
+      assert ended_ids == MapSet.new([canceled_id, expired_id])
+
+      # A literal status still matches literally.
+      canceled_ids = list.(%{"status" => "canceled"})
+      assert canceled_ids == MapSet.new([canceled_id])
+    end
+
     test "lists all subscriptions", %{subscription_ids: subscription_ids} do
       conn = request(:get, "/v1/subscriptions", %{})
 
@@ -1242,6 +1288,136 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       %{customer: customer, price: price, product: product, subscription: subscription}
     end
 
+    test "the proration invoice carries the price currency and prorated amounts", %{
+      customer: customer
+    } do
+      prod_conn = request(:post, "/v1/products", %{"name" => "EUR Plan"})
+      product = json_response(prod_conn)
+
+      eur_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "eur",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "19500"
+        })
+
+      eur_price = json_response(eur_price_conn)
+
+      eur_target_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "eur",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "99500"
+        })
+
+      eur_target = json_response(eur_target_conn)
+
+      sub_conn =
+        request(:post, "/v1/subscriptions", %{
+          "customer" => customer["id"],
+          "items" => [%{"price" => eur_price["id"], "quantity" => "1"}],
+          "status" => "active"
+        })
+
+      sub = json_response(sub_conn)
+      existing_item = hd(sub["items"]["data"])
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [
+            %{"id" => existing_item["id"], "deleted" => "true"},
+            %{"price" => eur_target["id"], "quantity" => "1"}
+          ],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      inv_conn = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{})
+      invoice = json_response(inv_conn)
+      assert invoice["currency"] == "eur"
+      assert invoice["status"] == "paid"
+      # Credit ~-19500 + charge ~99500 at a ~1.0 remaining ratio on a fresh
+      # subscription; a clock tick may shave a cent, so bounds not equality.
+      assert invoice["amount_paid"] >= 79_900 and invoice["amount_paid"] <= 80_000
+    end
+
+    test "adding an item by price leaves unmentioned items alone", %{
+      price: price,
+      subscription: sub
+    } do
+      prod_conn = request(:post, "/v1/products", %{"name" => "Support Add-on"})
+      product = json_response(prod_conn)
+
+      addon_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "usd",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "1500"
+        })
+
+      addon_price = json_response(addon_price_conn)
+
+      # The deltas real integrations send: just the new item. Stripe leaves
+      # every unmentioned item alone; deleting them turned "add an add-on"
+      # into "replace the whole subscription".
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"price" => addon_price["id"], "quantity" => "1"}],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      item_prices = updated["items"]["data"] |> Enum.map(& &1["price"]["id"]) |> Enum.sort()
+      assert item_prices == Enum.sort([price["id"], addon_price["id"]])
+    end
+
+    test "an item marked deleted is removed by the update", %{
+      customer: customer,
+      price: price,
+      subscription: sub
+    } do
+      _ = customer
+
+      prod_conn = request(:post, "/v1/products", %{"name" => "Upgrade Target Plan"})
+      product = json_response(prod_conn)
+
+      new_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "usd",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "9000"
+        })
+
+      new_price = json_response(new_price_conn)
+
+      get_conn = request(:get, "/v1/subscriptions/#{sub["id"]}", %{})
+      existing_item = hd(json_response(get_conn)["items"]["data"])
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [
+            %{"id" => existing_item["id"], "deleted" => "true"},
+            %{"price" => new_price["id"], "quantity" => "1"}
+          ],
+          "proration_behavior" => "create_prorations"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      item_prices = Enum.map(updated["items"]["data"], & &1["price"]["id"])
+      assert item_prices == [new_price["id"]]
+      refute price["id"] in item_prices
+    end
+
     test "creates proration invoice when proration_behavior is always_invoice", %{
       price: price,
       subscription: sub
@@ -1263,7 +1439,12 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       inv_conn = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{})
       assert inv_conn.status == 200
       invoice = json_response(inv_conn)
-      assert invoice["status"] == "open"
+      # Paid, not open: real Stripe charges an always_invoice proration against
+      # the customer's payment defaults, and the emulator's stance is that
+      # payments succeed. An invoice left open forever is a state no payable
+      # customer produces.
+      assert invoice["status"] == "paid"
+      assert invoice["paid"] == true
       assert invoice["subscription"] == sub["id"]
       assert invoice["customer"] == sub["customer"]
     end

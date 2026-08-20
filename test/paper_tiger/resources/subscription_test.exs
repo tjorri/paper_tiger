@@ -1288,6 +1288,79 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       %{customer: customer, price: price, product: product, subscription: subscription}
     end
 
+    test "adding an item by price leaves unmentioned items alone", %{
+      price: price,
+      subscription: sub
+    } do
+      prod_conn = request(:post, "/v1/products", %{"name" => "Support Add-on"})
+      product = json_response(prod_conn)
+
+      addon_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "usd",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "1500"
+        })
+
+      addon_price = json_response(addon_price_conn)
+
+      # The deltas real integrations send: just the new item. Stripe leaves
+      # every unmentioned item alone; deleting them turned "add an add-on"
+      # into "replace the whole subscription".
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"price" => addon_price["id"], "quantity" => "1"}],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      item_prices = updated["items"]["data"] |> Enum.map(& &1["price"]["id"]) |> Enum.sort()
+      assert item_prices == Enum.sort([price["id"], addon_price["id"]])
+    end
+
+    test "an item marked deleted is removed by the update", %{
+      customer: customer,
+      price: price,
+      subscription: sub
+    } do
+      _ = customer
+
+      prod_conn = request(:post, "/v1/products", %{"name" => "Upgrade Target Plan"})
+      product = json_response(prod_conn)
+
+      new_price_conn =
+        request(:post, "/v1/prices", %{
+          "currency" => "usd",
+          "product" => product["id"],
+          "recurring" => %{"interval" => "month"},
+          "unit_amount" => "9000"
+        })
+
+      new_price = json_response(new_price_conn)
+
+      get_conn = request(:get, "/v1/subscriptions/#{sub["id"]}", %{})
+      existing_item = hd(json_response(get_conn)["items"]["data"])
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [
+            %{"id" => existing_item["id"], "deleted" => "true"},
+            %{"price" => new_price["id"], "quantity" => "1"}
+          ],
+          "proration_behavior" => "create_prorations"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+
+      item_prices = Enum.map(updated["items"]["data"], & &1["price"]["id"])
+      assert item_prices == [new_price["id"]]
+      refute price["id"] in item_prices
+    end
+
     test "creates proration invoice when proration_behavior is always_invoice", %{
       price: price,
       subscription: sub

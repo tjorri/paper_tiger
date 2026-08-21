@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `init_data` can now seed webhook endpoints with deterministic custom IDs and
+  optional caller-supplied signing secrets; omitted IDs and secrets are
+  generated. Standalone containers can load the same JSON seed format from the
+  path supplied in `PAPER_TIGER_INIT_DATA`.
+
 ### Fixed
 
 - Standalone container releases now run the bootstrap worker, restoring

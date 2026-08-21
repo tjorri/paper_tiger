@@ -112,6 +112,17 @@ defmodule PaperTiger.Resources.SubscriptionTest do
     Jason.decode!(conn.resp_body)
   end
 
+  defp create_test_subscription(customer_id, price_id) do
+    conn =
+      request(:post, "/v1/subscriptions", %{
+        "customer" => customer_id,
+        "items" => [%{"price" => price_id, "quantity" => "1"}]
+      })
+
+    assert conn.status == 200
+    json_response(conn)
+  end
+
   describe "Subscription Setup" do
     test "create customer successfully" do
       conn = request(:post, "/v1/customers", %{"email" => "john@example.com"})
@@ -648,7 +659,7 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       assert body["status"] == "active"
     end
 
-    test "updates subscription items", %{price_id: price_id, subscription_id: subscription_id} do
+    test "id-less items add new subscription items", %{price_id: price_id, subscription_id: subscription_id} do
       # Create another price for the new item
       product_conn = request(:post, "/v1/products", %{"name" => "Add-on"})
       product = json_response(product_conn)
@@ -678,14 +689,163 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       assert conn.status == 200
       body = json_response(conn)
 
-      assert length(body["items"]["data"]) == 2
+      assert length(body["items"]["data"]) == 3
 
-      # Verify quantities were updated
-      item1 = Enum.at(body["items"]["data"], 0)
-      assert item1["quantity"] == 2
+      same_price_quantities =
+        body["items"]["data"]
+        |> Enum.filter(&(&1["price"]["id"] == price_id))
+        |> Enum.map(& &1["quantity"])
+        |> Enum.sort()
 
-      item2 = Enum.at(body["items"]["data"], 1)
-      assert item2["quantity"] == 1
+      assert same_price_quantities == [1, 2]
+
+      addon_item = Enum.find(body["items"]["data"], &(&1["price"]["id"] == addon_price_id))
+      assert addon_item["quantity"] == 1
+    end
+
+    test "an item ID updates the existing subscription item", %{
+      subscription_id: subscription_id
+    } do
+      retrieve_conn = request(:get, "/v1/subscriptions/#{subscription_id}", %{})
+      [existing_item] = json_response(retrieve_conn)["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [%{"id" => existing_item["id"], "quantity" => "4"}]
+        })
+
+      assert update_conn.status == 200
+      [updated_item] = json_response(update_conn)["items"]["data"]
+      assert updated_item["id"] == existing_item["id"]
+      assert updated_item["quantity"] == 4
+    end
+
+    test "rejects a foreign item update before applying any mutations", %{
+      customer_id: customer_id,
+      price_id: price_id,
+      subscription_id: subscription_id
+    } do
+      other_subscription = create_test_subscription(customer_id, price_id)
+      [foreign_item] = other_subscription["items"]["data"]
+
+      target_conn = request(:get, "/v1/subscriptions/#{subscription_id}", %{})
+      [target_item] = json_response(target_conn)["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [
+            %{"id" => target_item["id"], "quantity" => "2"},
+            %{"id" => foreign_item["id"], "quantity" => "9"}
+          ],
+          "metadata" => %{"must_not_persist" => "true"}
+        })
+
+      assert update_conn.status == 400
+      error = json_response(update_conn)["error"]
+      assert error["type"] == "invalid_request_error"
+      assert error["param"] == "items[1][id]"
+
+      target_after = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      [target_item_after] = target_after["items"]["data"]
+      assert target_item_after["quantity"] == 1
+      refute Map.has_key?(target_after["metadata"], "must_not_persist")
+
+      other_after = request(:get, "/v1/subscriptions/#{other_subscription["id"]}", %{}) |> json_response()
+      [foreign_item_after] = other_after["items"]["data"]
+      assert foreign_item_after["id"] == foreign_item["id"]
+      assert foreign_item_after["quantity"] == 1
+      assert foreign_item_after["subscription"] == other_subscription["id"]
+    end
+
+    test "rejects deletion of an item owned by another subscription", %{
+      customer_id: customer_id,
+      price_id: price_id,
+      subscription_id: subscription_id
+    } do
+      other_subscription = create_test_subscription(customer_id, price_id)
+      [foreign_item] = other_subscription["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [%{"deleted" => "true", "id" => foreign_item["id"]}]
+        })
+
+      assert update_conn.status == 400
+      assert json_response(update_conn)["error"]["param"] == "items[0][id]"
+
+      target_after = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      assert length(target_after["items"]["data"]) == 1
+
+      other_after = request(:get, "/v1/subscriptions/#{other_subscription["id"]}", %{}) |> json_response()
+      assert Enum.map(other_after["items"]["data"], & &1["id"]) == [foreign_item["id"]]
+    end
+
+    test "rejects an unknown subscription item ID without mutation", %{
+      subscription_id: subscription_id
+    } do
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [%{"id" => "si_missing", "quantity" => "2"}],
+          "metadata" => %{"must_not_persist" => "true"}
+        })
+
+      assert update_conn.status == 400
+      assert json_response(update_conn)["error"]["param"] == "items[0][id]"
+
+      subscription = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      [item] = subscription["items"]["data"]
+      assert item["quantity"] == 1
+      refute Map.has_key?(subscription["metadata"], "must_not_persist")
+    end
+
+    test "rejects duplicate item IDs before mutation", %{subscription_id: subscription_id} do
+      retrieve_conn = request(:get, "/v1/subscriptions/#{subscription_id}", %{})
+      [existing_item] = json_response(retrieve_conn)["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [
+            %{"id" => existing_item["id"], "quantity" => "2"},
+            %{"id" => existing_item["id"], "quantity" => "3"}
+          ]
+        })
+
+      assert update_conn.status == 400
+      assert json_response(update_conn)["error"]["param"] == "items[1][id]"
+
+      subscription = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      [item] = subscription["items"]["data"]
+      assert item["quantity"] == 1
+    end
+
+    test "rejects an unknown item price before mutation", %{subscription_id: subscription_id} do
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [%{"price" => "price_missing", "quantity" => "2"}],
+          "metadata" => %{"must_not_persist" => "true"}
+        })
+
+      assert update_conn.status == 404
+      error = json_response(update_conn)["error"]
+      assert error["code"] == "resource_missing"
+      assert error["param"] == "items[0][price]"
+
+      subscription = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      assert length(subscription["items"]["data"]) == 1
+      refute Map.has_key?(subscription["metadata"], "must_not_persist")
+    end
+
+    test "requires an item ID for deletion", %{subscription_id: subscription_id} do
+      update_conn =
+        request(:post, "/v1/subscriptions/#{subscription_id}", %{
+          "items" => [%{"deleted" => "true"}]
+        })
+
+      assert update_conn.status == 400
+      assert json_response(update_conn)["error"]["param"] == "items[0][id]"
+
+      subscription = request(:get, "/v1/subscriptions/#{subscription_id}", %{}) |> json_response()
+      assert length(subscription["items"]["data"]) == 1
     end
 
     test "returns 404 for non-existent subscription" do
@@ -1347,7 +1507,7 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       update_conn =
         request(:post, "/v1/subscriptions/#{sub["id"]}", %{
           "items" => [
-            %{"id" => existing_item["id"], "deleted" => "true"},
+            %{"deleted" => "true", "id" => existing_item["id"]},
             %{"price" => new_price["id"], "quantity" => "1"}
           ],
           "proration_behavior" => "create_prorations"

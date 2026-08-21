@@ -1052,7 +1052,10 @@ config :stripity_stripe,
 
 ### Initial Data
 
-PaperTiger can pre-populate products, prices, customers, and webhook endpoints on startup via the `init_data` config. Since ETS is ephemeral, this runs on every application start - useful for development environments where you need consistent Stripe data available immediately.
+PaperTiger can pre-populate products, prices, customers, and webhook endpoints
+on startup via the `init_data` config. Since ETS is ephemeral, this runs on
+every application start - useful for development environments where you need
+consistent Stripe data available immediately.
 
 ```elixir
 # config/dev.exs - From a JSON file
@@ -1082,7 +1085,9 @@ config :paper_tiger,
   }
 ```
 
-Webhook endpoints may carry a caller-supplied `secret` (`whsec_*`), so a receiver that needs the signing secret in its own configuration before either process starts can commit one value and hand it to both sides:
+Webhook endpoints may carry a caller-supplied `secret` (`whsec_*`), so a
+receiver that needs the signing secret in its own configuration before either
+process starts can commit one value and hand it to both sides:
 
 ```elixir
 config :paper_tiger,
@@ -1098,7 +1103,8 @@ config :paper_tiger,
   }
 ```
 
-The standalone container image reads `PAPER_TIGER_INIT_DATA` — a path to a JSON file of the same shape, typically mounted into the container.
+The standalone container image reads `PAPER_TIGER_INIT_DATA` — a path to a JSON
+file of the same format, typically mounted into the container.
 
 Use custom IDs (like `prod_dev_*`) to ensure deterministic data across restarts. This is particularly useful when your app syncs from Stripe on startup - the data will be there before your sync runs.
 

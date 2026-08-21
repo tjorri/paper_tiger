@@ -67,10 +67,10 @@ defmodule PaperTiger.InitializerTest do
       data = %{
         "webhook_endpoints" => [
           %{
+            "enabled_events" => ["customer.subscription.created", "customer.subscription.updated"],
             "id" => "we_test_1",
-            "url" => "http://receiver.internal/webhook",
             "secret" => "whsec_fixed_for_test",
-            "enabled_events" => ["customer.subscription.created", "customer.subscription.updated"]
+            "url" => "http://receiver.internal/webhook"
           }
         ]
       }
@@ -83,6 +83,22 @@ defmodule PaperTiger.InitializerTest do
       assert webhook.url == "http://receiver.internal/webhook"
       assert webhook.status == "enabled"
       assert webhook.enabled_events == ["customer.subscription.created", "customer.subscription.updated"]
+    end
+
+    test "generates an id and signing secret when they are omitted" do
+      data = %{
+        "webhook_endpoints" => [
+          %{"url" => "http://receiver.internal/generated-webhook"}
+        ]
+      }
+
+      assert {:ok, stats} = Initializer.load_from_map(data)
+      assert stats.webhook_endpoints == 1
+
+      [webhook] = Webhooks.list(limit: 10).data
+      assert String.starts_with?(webhook.id, "we_")
+      assert webhook.secret =~ ~r/\Awhsec_[0-9a-f]{32}\z/
+      assert webhook.enabled_events == ["*"]
     end
 
     test "loads plans" do
@@ -251,6 +267,7 @@ defmodule PaperTiger.InitializerTest do
       assert stats.prices == 0
       assert stats.plans == 0
       assert stats.customers == 0
+      assert stats.webhook_endpoints == 0
     end
   end
 

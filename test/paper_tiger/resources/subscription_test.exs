@@ -906,7 +906,7 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       list = fn params ->
         conn = request(:get, "/v1/subscriptions", Map.put(params, "customer", customer_id))
         assert conn.status == 200
-        json_response(conn)["data"] |> Enum.map(& &1["id"]) |> MapSet.new()
+        json_response(conn)["data"] |> MapSet.new(& &1["id"])
       end
 
       # No value: everything that has not been canceled.

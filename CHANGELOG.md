@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Subscription listing now follows Stripe's documented `status` contract: no
+  value excludes canceled subscriptions, `all` includes every status, `ended`
+  includes canceled and `incomplete_expired`, and literal statuses continue to
+  match directly.
 - Standalone container releases now run the bootstrap worker, restoring
   predefined test tokens, configured data sources, `init_data`, and configured
   webhooks. Bootstrap also skips repository readiness checks when no repository

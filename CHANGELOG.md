@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Subscription item updates now apply as validated deltas: id-less entries add
+  items, explicit IDs update or delete only items owned by that subscription,
+  and an invalid batch cannot partially mutate subscription data.
 - Subscription listing now follows Stripe's documented `status` contract: no
   value excludes canceled subscriptions, `all` includes every status, `ended`
   includes canceled and `incomplete_expired`, and literal statuses continue to

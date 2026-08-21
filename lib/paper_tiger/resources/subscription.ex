@@ -151,15 +151,14 @@ defmodule PaperTiger.Resources.Subscription do
   def update(conn, id) do
     with {:ok, existing} <- Subscriptions.get(id),
          existing_items = SubscriptionItems.find_by_subscription(id),
+         {:ok, item_operations} <-
+           prepare_subscription_item_updates(id, existing_items, Map.get(conn.params, :items)),
          coerced_params = coerce_update_params(conn.params),
          updated = merge_updates(existing, coerced_params),
          updated = maybe_update_discount(updated, conn.params),
          updated = maybe_activate_subscription_after_trial(updated),
-         {:ok, updated} <- Subscriptions.update(updated) do
-      if Map.has_key?(conn.params, :items) do
-        update_subscription_items(id, conn.params.items)
-      end
-
+         {:ok, updated} <- Subscriptions.update(updated),
+         :ok <- apply_subscription_item_operations(item_operations) do
       items_after_update = SubscriptionItems.find_by_subscription(id)
       billable_items_changed = billable_items_changed?(existing_items, items_after_update)
       updated = maybe_create_proration_invoice(updated, conn.params, billable_items_changed)
@@ -175,6 +174,9 @@ defmodule PaperTiger.Resources.Subscription do
     else
       {:error, :not_found} ->
         error_response(conn, PaperTiger.Error.not_found("subscription", id))
+
+      {:error, %PaperTiger.Error{} = error} ->
+        error_response(conn, error)
     end
   end
 
@@ -558,68 +560,144 @@ defmodule PaperTiger.Resources.Subscription do
     }
   end
 
-  # Stripe's update items are DELTAS, not a replacement list: an entry with an
-  # id updates (or, with deleted: true, removes) that item; an id-less entry
-  # whose price matches an existing item updates it; an id-less entry with a
-  # new price adds an item; and items the payload does not mention are left
-  # alone. The previous implementation deleted every unmentioned item, so a
-  # client adding one item — the deltas real integrations send — silently lost
-  # the rest of the subscription.
-  defp update_subscription_items(subscription_id, items) when is_list(items) do
-    existing_items = SubscriptionItems.find_by_subscription(subscription_id)
+  # Stripe treats update items as deltas: an id updates or deletes the named
+  # item, an id-less entry adds an item, and unmentioned items remain unchanged.
+  # Prepare every operation before writing so one invalid item rejects the
+  # entire request without partially mutating the subscription or its items.
+  defp prepare_subscription_item_updates(subscription_id, existing_items, items) when is_list(items) do
     existing_by_id = Map.new(existing_items, &{&1.id, &1})
-
-    existing_by_price =
-      Map.new(existing_items, fn item ->
-        price = item[:price]
-        price_id = if is_map(price), do: price[:id] || price["id"], else: price
-        {to_string(price_id), item}
-      end)
-
     now = PaperTiger.now()
 
+    with :ok <- validate_unique_subscription_item_ids(items) do
+      items
+      |> Enum.with_index()
+      |> Enum.reduce_while(
+        {:ok, []},
+        &accumulate_subscription_item_operation(&1, &2, subscription_id, existing_by_id, now)
+      )
+      |> reverse_prepared_operations()
+    end
+  end
+
+  defp prepare_subscription_item_updates(_subscription_id, _existing_items, _items), do: {:ok, []}
+
+  defp accumulate_subscription_item_operation({item, index}, {:ok, operations}, subscription_id, existing_by_id, now) do
+    case prepare_subscription_item_operation(subscription_id, existing_by_id, item, index, now) do
+      {:ok, operation} -> {:cont, {:ok, [operation | operations]}}
+      {:error, error} -> {:halt, {:error, error}}
+    end
+  end
+
+  defp validate_unique_subscription_item_ids(items) do
     items
     |> Enum.with_index()
-    |> Enum.each(fn {item, index} ->
+    |> Enum.reduce_while(MapSet.new(), fn {item, index}, seen_ids ->
       item_id = get_item_field(item, :id)
-      price_ref = get_item_field(item, :price)
-      price_match = price_ref && Map.get(existing_by_price, to_string(price_ref))
 
-      cond do
-        # Explicitly deleted — remove it. The only deletion path.
-        item_id && item_deleted?(item) ->
-          SubscriptionItems.delete(item_id)
+      if item_id && MapSet.member?(seen_ids, item_id) do
+        error =
+          PaperTiger.Error.invalid_request(
+            "Cannot update the same subscription item more than once",
+            "items[#{index}][id]"
+          )
 
-        # Item named by id and exists — update it.
-        item_id && Map.has_key?(existing_by_id, item_id) ->
-          existing = existing_by_id[item_id]
-          updated = update_existing_item(existing, item)
-          SubscriptionItems.update(updated)
-
-        # Item named by id but doesn't exist — create with that id (edge case).
-        item_id ->
-          new_item = build_subscription_item(subscription_id, item, now + index, item_id)
-          SubscriptionItems.insert(new_item)
-
-        # No id, but the price matches an existing item — Stripe updates that
-        # item rather than adding a duplicate.
-        price_match ->
-          updated = update_existing_item(price_match, item)
-          SubscriptionItems.update(updated)
-
-        # No id, new price — add an item.
-        true ->
-          new_item = build_subscription_item(subscription_id, item, now + index, nil)
-          SubscriptionItems.insert(new_item)
+        {:halt, {:error, error}}
+      else
+        {:cont, if(item_id, do: MapSet.put(seen_ids, item_id), else: seen_ids)}
       end
+    end)
+    |> case do
+      %MapSet{} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp prepare_subscription_item_operation(subscription_id, existing_by_id, item, index, now) do
+    case get_item_field(item, :id) do
+      nil -> prepare_new_subscription_item(subscription_id, item, index, now)
+      item_id -> prepare_existing_subscription_item(existing_by_id, item_id, item, index)
+    end
+  end
+
+  defp prepare_existing_subscription_item(existing_by_id, item_id, item, index) do
+    case Map.fetch(existing_by_id, item_id) do
+      {:ok, existing} -> prepare_existing_subscription_item(existing, item, index)
+      :error -> {:error, invalid_subscription_item_error(item_id, index)}
+    end
+  end
+
+  defp prepare_existing_subscription_item(existing, item, index) do
+    if item_deleted?(item) do
+      {:ok, {:delete, existing.id}}
+    else
+      with :ok <- validate_optional_subscription_item_price(item, index) do
+        {:ok, {:update, update_existing_item(existing, item)}}
+      end
+    end
+  end
+
+  defp prepare_new_subscription_item(subscription_id, item, index, now) do
+    if item_deleted?(item) do
+      {:error, PaperTiger.Error.invalid_request("Missing required parameter", "items[#{index}][id]")}
+    else
+      with :ok <- validate_required_subscription_item_price(item, index) do
+        {:ok, {:insert, build_subscription_item(subscription_id, item, now + index, nil)}}
+      end
+    end
+  end
+
+  defp validate_optional_subscription_item_price(item, index) do
+    case get_item_field(item, :price) do
+      nil -> :ok
+      price_id -> validate_subscription_item_price(price_id, index)
+    end
+  end
+
+  defp validate_required_subscription_item_price(item, index) do
+    case get_item_field(item, :price) do
+      nil -> {:error, PaperTiger.Error.invalid_request("Missing required parameter", "items[#{index}][price]")}
+      price_id -> validate_subscription_item_price(price_id, index)
+    end
+  end
+
+  defp validate_subscription_item_price(price_id, index) do
+    case validate_price_or_plan_exists(price_id) do
+      :ok -> :ok
+      {:error, :not_found} -> {:error, subscription_item_price_not_found_error(price_id, index)}
+    end
+  end
+
+  defp invalid_subscription_item_error(item_id, index) do
+    PaperTiger.Error.invalid_request(
+      "Subscription item '#{item_id}' does not belong to this subscription",
+      "items[#{index}][id]"
+    )
+  end
+
+  defp subscription_item_price_not_found_error(price_id, index) do
+    %PaperTiger.Error{
+      code: "resource_missing",
+      message: "No such price: '#{price_id}'",
+      param: "items[#{index}][price]",
+      status: 404,
+      type: "invalid_request_error"
+    }
+  end
+
+  defp reverse_prepared_operations({:ok, operations}), do: {:ok, Enum.reverse(operations)}
+  defp reverse_prepared_operations(error), do: error
+
+  defp apply_subscription_item_operations(operations) do
+    Enum.each(operations, fn
+      {:delete, item_id} -> :ok = SubscriptionItems.delete(item_id)
+      {:insert, item} -> {:ok, _item} = SubscriptionItems.insert(item)
+      {:update, item} -> {:ok, _item} = SubscriptionItems.update(item)
     end)
 
     :ok
   end
 
-  defp update_subscription_items(_subscription_id, _invalid), do: :ok
-
-  # Form-encoded bodies carry booleans as strings, so accept both shapes.
+  # Form-encoded bodies carry booleans as strings, so accept both forms.
   defp item_deleted?(item), do: get_item_field(item, :deleted) in [true, "true"]
 
   defp build_subscription_item(subscription_id, item, created_at, custom_id) do

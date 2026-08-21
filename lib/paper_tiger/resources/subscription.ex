@@ -398,6 +398,7 @@ defmodule PaperTiger.Resources.Subscription do
       customer: Map.get(params, :customer),
       days_until_due: nil,
       default_payment_method: Map.get(params, :default_payment_method),
+      default_source: Map.get(params, :default_source),
       discount: Discounts.build_from_params(params),
       ended_at: nil,
       id: generate_id("sub", Map.get(params, :id)),
@@ -777,7 +778,7 @@ defmodule PaperTiger.Resources.Subscription do
     proration_behavior = Map.get(params, :proration_behavior)
 
     if should_create_proration_invoice?(billable_items_changed?, proration_behavior),
-      do: create_proration_invoice(subscription, proration_behavior),
+      do: create_proration_invoice(subscription, params),
       else: subscription
   end
 
@@ -785,14 +786,17 @@ defmodule PaperTiger.Resources.Subscription do
     billable_items_changed? and proration_behavior in ["always_invoice", "create_prorations"]
   end
 
-  defp create_proration_invoice(subscription, proration_behavior) do
+  defp create_proration_invoice(subscription, params) do
+    proration_behavior = Map.get(params, :proration_behavior)
     items = SubscriptionItems.find_by_subscription(subscription.id)
     now = PaperTiger.now()
     invoice_id = generate_id("in")
     lines = Enum.map(items, &build_proration_invoice_line(&1, now, proration_behavior))
     total = Enum.reduce(lines, 0, fn line, acc -> acc + line.amount end)
-    auto_paid = proration_auto_paid?(subscription, proration_behavior)
+    payment_credential = effective_payment_credential(subscription)
+    auto_paid = proration_auto_paid?(subscription, payment_credential, proration_behavior)
     status = proration_invoice_status(proration_behavior, auto_paid)
+    subscription = maybe_mark_proration_payment_failed(subscription, params, auto_paid)
 
     invoice =
       build_proration_invoice_payload(
@@ -835,24 +839,33 @@ defmodule PaperTiger.Resources.Subscription do
   defp line_price_id(price) when is_map(price), do: price[:id]
   defp line_price_id(_price), do: "unknown"
 
-  # Real Stripe charges an always_invoice proration against the subscription's
-  # default payment method, falling back to the customer's invoice settings and
-  # default source — surfaces this emulator does not model. Conditioning on the
-  # subscription-level field alone left every such invoice open forever, which
-  # no configuration of a real, payable customer produces. The emulator's
-  # stance everywhere else is that payments succeed (checkout sessions
-  # auto-complete), so the proration charge succeeds too.
-  defp proration_auto_paid?(_subscription, proration_behavior) do
-    proration_behavior == "always_invoice"
+  defp proration_auto_paid?(subscription, payment_credential, proration_behavior) do
+    proration_behavior == "always_invoice" and
+      Map.get(subscription, :collection_method, "charge_automatically") == "charge_automatically" and
+      not is_nil(payment_credential)
   end
 
   defp proration_invoice_status("always_invoice", true), do: "paid"
   defp proration_invoice_status("always_invoice", false), do: "open"
   defp proration_invoice_status(_, _), do: "draft"
 
+  defp maybe_mark_proration_payment_failed(subscription, params, false) do
+    payment_behavior = Map.get(params, :payment_behavior, "allow_incomplete")
+
+    if Map.get(subscription, :collection_method, "charge_automatically") == "charge_automatically" and
+         Map.get(params, :proration_behavior) == "always_invoice" and
+         payment_behavior in ["allow_incomplete", "default_incomplete"] do
+      Map.put(subscription, :status, "past_due")
+    else
+      subscription
+    end
+  end
+
+  defp maybe_mark_proration_payment_failed(subscription, _params, _auto_paid), do: subscription
+
   defp build_proration_invoice_payload(subscription, invoice_id, lines, now, total, auto_paid, status) do
     %{
-      amount_due: if(auto_paid, do: 0, else: total),
+      amount_due: total,
       amount_paid: if(auto_paid, do: total, else: 0),
       amount_remaining: if(auto_paid, do: 0, else: total),
       created: now,
@@ -867,7 +880,12 @@ defmodule PaperTiger.Resources.Subscription do
       period_end: now + 30 * 86_400,
       period_start: now,
       status: status,
-      status_transitions: %{finalized_at: nil, marked_uncollectible_at: nil, paid_at: nil, voided_at: nil},
+      status_transitions: %{
+        finalized_at: if(status in ["open", "paid"], do: now),
+        marked_uncollectible_at: nil,
+        paid_at: if(auto_paid, do: now),
+        voided_at: nil
+      },
       subscription: subscription.id,
       subtotal: total,
       total: total
@@ -879,6 +897,43 @@ defmodule PaperTiger.Resources.Subscription do
     {:ok, _} = Subscriptions.update(updated)
     updated
   end
+
+  # Stripe resolves automatic invoice payment in this order: subscription
+  # payment method/source, then customer invoice settings/default source.
+  defp effective_payment_credential(subscription) do
+    subscription_credentials = [
+      {:payment_method, Map.get(subscription, :default_payment_method)},
+      {:source, Map.get(subscription, :default_source)}
+    ]
+
+    Enum.find(
+      subscription_credentials ++ customer_payment_credentials(subscription.customer),
+      &valid_payment_credential?/1
+    )
+  end
+
+  defp customer_payment_credentials(customer_id) do
+    case Customers.get(customer_id) do
+      {:ok, customer} ->
+        invoice_settings = Map.get(customer, :invoice_settings) || %{}
+
+        [
+          {:payment_method, payment_field(invoice_settings, :default_payment_method)},
+          {:payment_method, payment_field(customer, :default_payment_method)},
+          {:source, payment_field(customer, :default_source)}
+        ]
+
+      {:error, :not_found} ->
+        []
+    end
+  end
+
+  defp payment_field(map, field), do: Map.get(map, field) || Map.get(map, Atom.to_string(field))
+
+  defp valid_payment_credential?({_type, id}), do: is_binary(id) and id != ""
+
+  defp payment_credential_id({type, id}, type), do: id
+  defp payment_credential_id(_credential, _type), do: nil
 
   # Only emit telemetry when something actually changed, matching Stripe's
   # behavior. Without this, no-op metadata updates create an infinite
@@ -928,15 +983,15 @@ defmodule PaperTiger.Resources.Subscription do
     if payment_behavior == "default_incomplete" and subscription.status != "trialing" do
       now = PaperTiger.now()
       subtotal = calculate_items_total(items)
-      default_pm = Map.get(params, :default_payment_method)
+      payment_credential = effective_payment_credential(subscription)
       automatic_tax = AutomaticTax.automatic_tax(params, :invoice)
 
       # If payment method provided, auto-confirm; otherwise requires_payment_method
       {pi_status, inv_status, sub_status, paid, amt_paid, amt_remaining} =
-        if default_pm do
+        if payment_credential do
           {"succeeded", "paid", "active", true, :paid_total, 0}
         else
-          {"requires_payment_method", "draft", "incomplete", false, 0, :remaining_total}
+          {"requires_payment_method", "open", "incomplete", false, 0, :remaining_total}
         end
 
       # Create invoice with payment_intent reference
@@ -965,13 +1020,14 @@ defmodule PaperTiger.Resources.Subscription do
         currency: "usd",
         customer: subscription.customer,
         id: pi_id,
-        invoice: nil,
+        invoice: invoice_id,
         last_payment_error: nil,
         livemode: false,
         metadata: %{},
         next_action: nil,
         object: "payment_intent",
-        payment_method: default_pm,
+        payment_method: payment_credential_id(payment_credential, :payment_method),
+        source: payment_credential_id(payment_credential, :source),
         status: pi_status
       }
 
@@ -995,7 +1051,12 @@ defmodule PaperTiger.Resources.Subscription do
         period_end: now + 30 * 86_400,
         period_start: now,
         status: inv_status,
-        status_transitions: %{finalized_at: nil, marked_uncollectible_at: nil, paid_at: nil, voided_at: nil},
+        status_transitions: %{
+          finalized_at: now,
+          marked_uncollectible_at: nil,
+          paid_at: if(paid, do: now),
+          voided_at: nil
+        },
         subscription: subscription.id,
         subtotal: subtotal,
         tax: totals.amount_tax,

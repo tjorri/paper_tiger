@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Automatic subscription invoice payments now honor subscription and customer
+  payment-method/source fallbacks, while invoices with no usable payment
+  credential remain unpaid and move applicable updates to `past_due`.
 - Subscription item updates now apply as validated deltas: id-less entries add
   items, explicit IDs update or delete only items owned by that subscription,
   and an invalid batch cannot partially mutate subscription data.

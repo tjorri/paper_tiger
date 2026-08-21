@@ -123,6 +123,37 @@ defmodule PaperTiger.Resources.SubscriptionTest do
     json_response(conn)
   end
 
+  defp create_attached_payment_method(customer_id) do
+    create_conn =
+      request(:post, "/v1/payment_methods", %{
+        "card" => %{"brand" => "visa", "exp_month" => 12, "exp_year" => 2030, "last4" => "4242"},
+        "type" => "card"
+      })
+
+    assert create_conn.status == 200
+    payment_method = json_response(create_conn)
+
+    attach_conn =
+      request(:post, "/v1/payment_methods/#{payment_method["id"]}/attach", %{
+        "customer" => customer_id
+      })
+
+    assert attach_conn.status == 200
+    payment_method
+  end
+
+  defp create_chargeable_source(customer_id) do
+    conn =
+      request(:post, "/v1/sources", %{
+        "customer" => customer_id,
+        "status" => "chargeable",
+        "type" => "card"
+      })
+
+    assert conn.status == 200
+    json_response(conn)
+  end
+
   describe "Subscription Setup" do
     test "create customer successfully" do
       conn = request(:post, "/v1/customers", %{"email" => "john@example.com"})
@@ -1542,12 +1573,13 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       inv_conn = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{})
       assert inv_conn.status == 200
       invoice = json_response(inv_conn)
-      # Paid, not open: real Stripe charges an always_invoice proration against
-      # the customer's payment defaults, and the emulator's stance is that
-      # payments succeed. An invoice left open forever is a state no payable
-      # customer produces.
-      assert invoice["status"] == "paid"
-      assert invoice["paid"] == true
+      assert updated["status"] == "past_due"
+      assert invoice["status"] == "open"
+      assert invoice["paid"] == false
+      assert invoice["amount_due"] > 0
+      assert invoice["amount_paid"] == 0
+      assert invoice["amount_remaining"] == invoice["amount_due"]
+      assert is_nil(invoice["status_transitions"]["paid_at"])
       assert invoice["subscription"] == sub["id"]
       assert invoice["customer"] == sub["customer"]
     end
@@ -1649,7 +1681,86 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       invoice = json_response(inv_conn)
       assert invoice["status"] == "paid"
       assert invoice["paid"] == true
+      assert invoice["amount_due"] > 0
+      assert invoice["amount_paid"] == invoice["amount_due"]
       assert invoice["amount_remaining"] == 0
+      assert is_integer(invoice["status_transitions"]["paid_at"])
+    end
+
+    test "auto-pays with the customer invoice-settings payment method", %{
+      customer: customer,
+      subscription: sub
+    } do
+      payment_method = create_attached_payment_method(customer["id"])
+
+      customer_conn =
+        request(:post, "/v1/customers/#{customer["id"]}", %{
+          "invoice_settings" => %{"default_payment_method" => payment_method["id"]}
+        })
+
+      assert customer_conn.status == 200
+      [item] = sub["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"id" => item["id"], "quantity" => "2"}],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+      invoice = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{}) |> json_response()
+      assert updated["status"] == "active"
+      assert invoice["status"] == "paid"
+      assert invoice["paid"] == true
+    end
+
+    test "auto-pays with the customer default source", %{
+      customer: customer,
+      subscription: sub
+    } do
+      source = create_chargeable_source(customer["id"])
+
+      customer_conn =
+        request(:post, "/v1/customers/#{customer["id"]}", %{
+          "default_source" => source["id"]
+        })
+
+      assert customer_conn.status == 200
+      [item] = sub["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"id" => item["id"], "quantity" => "2"}],
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+      invoice = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{}) |> json_response()
+      assert updated["status"] == "active"
+      assert invoice["status"] == "paid"
+      assert invoice["paid"] == true
+    end
+
+    test "default_incomplete marks an unpaid proration update past_due", %{
+      subscription: sub
+    } do
+      [item] = sub["items"]["data"]
+
+      update_conn =
+        request(:post, "/v1/subscriptions/#{sub["id"]}", %{
+          "items" => [%{"id" => item["id"], "quantity" => "2"}],
+          "payment_behavior" => "default_incomplete",
+          "proration_behavior" => "always_invoice"
+        })
+
+      assert update_conn.status == 200
+      updated = json_response(update_conn)
+      invoice = request(:get, "/v1/invoices/#{updated["latest_invoice"]}", %{}) |> json_response()
+      assert updated["status"] == "past_due"
+      assert invoice["status"] == "open"
+      assert invoice["paid"] == false
     end
   end
 
@@ -1695,6 +1806,10 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       invoice = json_response(inv_conn)
       assert invoice["subscription"] == sub["id"]
       assert invoice["customer"] == customer["id"]
+      assert invoice["status"] == "open"
+      assert invoice["paid"] == false
+      assert invoice["amount_paid"] == 0
+      assert invoice["amount_remaining"] == invoice["amount_due"]
       assert is_binary(invoice["payment_intent"])
       assert String.starts_with?(invoice["payment_intent"], "pi_")
 
@@ -1705,6 +1820,7 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       assert pi["status"] == "requires_payment_method"
       assert pi["amount"] == 19_800
       assert pi["client_secret"] != nil
+      assert pi["invoice"] == invoice["id"]
     end
 
     test "applies automatic tax to default_incomplete subscription invoice", %{customer: customer, price: price} do
@@ -1801,6 +1917,63 @@ defmodule PaperTiger.Resources.SubscriptionTest do
       pi = json_response(pi_conn)
       assert pi["status"] == "succeeded"
       assert pi["payment_method"] == pm["id"]
+    end
+
+    test "uses the customer invoice-settings payment method", %{customer: customer, price: price} do
+      payment_method = create_attached_payment_method(customer["id"])
+
+      customer_conn =
+        request(:post, "/v1/customers/#{customer["id"]}", %{
+          "invoice_settings" => %{"default_payment_method" => payment_method["id"]}
+        })
+
+      assert customer_conn.status == 200
+
+      sub_conn =
+        request(:post, "/v1/subscriptions", %{
+          "customer" => customer["id"],
+          "items" => [%{"price" => price["id"], "quantity" => "1"}],
+          "payment_behavior" => "default_incomplete"
+        })
+
+      assert sub_conn.status == 200
+      sub = json_response(sub_conn)
+      invoice = request(:get, "/v1/invoices/#{sub["latest_invoice"]}", %{}) |> json_response()
+      payment_intent = request(:get, "/v1/payment_intents/#{invoice["payment_intent"]}", %{}) |> json_response()
+
+      assert sub["status"] == "active"
+      assert invoice["status"] == "paid"
+      assert payment_intent["status"] == "succeeded"
+      assert payment_intent["payment_method"] == payment_method["id"]
+    end
+
+    test "uses the customer default source", %{customer: customer, price: price} do
+      source = create_chargeable_source(customer["id"])
+
+      customer_conn =
+        request(:post, "/v1/customers/#{customer["id"]}", %{
+          "default_source" => source["id"]
+        })
+
+      assert customer_conn.status == 200
+
+      sub_conn =
+        request(:post, "/v1/subscriptions", %{
+          "customer" => customer["id"],
+          "items" => [%{"price" => price["id"], "quantity" => "1"}],
+          "payment_behavior" => "default_incomplete"
+        })
+
+      assert sub_conn.status == 200
+      sub = json_response(sub_conn)
+      invoice = request(:get, "/v1/invoices/#{sub["latest_invoice"]}", %{}) |> json_response()
+      payment_intent = request(:get, "/v1/payment_intents/#{invoice["payment_intent"]}", %{}) |> json_response()
+
+      assert sub["status"] == "active"
+      assert invoice["status"] == "paid"
+      assert payment_intent["status"] == "succeeded"
+      assert payment_intent["source"] == source["id"]
+      assert is_nil(payment_intent["payment_method"])
     end
 
     test "skips PI creation for trialing subscriptions", %{customer: customer, price: price} do
